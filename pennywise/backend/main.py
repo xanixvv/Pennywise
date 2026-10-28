@@ -9,7 +9,20 @@ from database import init_db, connect, DB_PATH
 from schemas import TransactionIn, AccountIn, BudgetIn, GoalIn, GoalContribution, CategoryIn, ImportIn
 
 app = FastAPI(title='Pennywise API', version='1.0.0')
-app.add_middleware(CORSMiddleware, allow_origins=['http://localhost:5173','http://127.0.0.1:5173'], allow_origin_regex=r'https?://(localhost|127\.0\.0\.1|192\.168\.\d+\.\d+|10\.\d+\.\d+\.\d+|172\.(1[6-9]|2\d|3[01])\.\d+\.\d+)(:\d+)?', allow_credentials=True, allow_methods=['*'], allow_headers=['*'])
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=[
+        "http://localhost:5173",
+        "http://127.0.0.1:5173",
+        "https://frontend-guke.vercel.app",
+    ],
+    allow_origin_regex=r"https?://(localhost|127\.0\.0\.1|192\.168\.\d+\.\d+|10\.\d+\.\d+\.\d+|172\.(1[6-9]|2\d|3[01])\.\d+\.\d+)(:\d+)?",
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
 
 @app.on_event('startup')
 def startup(): init_db()
