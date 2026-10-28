@@ -1,14 +1,49 @@
-from fastapi import FastAPI, HTTPException, Query, Body
+from fastapi import FastAPI, HTTPException, Query, Body, Request
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import StreamingResponse, JSONResponse
 from fastapi.responses import StreamingResponse
 from pathlib import Path
 from datetime import date, datetime
 from io import StringIO
 import csv, json, sqlite3
-from database import init_db, connect, DB_PATH
+from database import (
+    init_db,
+    connect,
+    central_connect,
+    set_active_user,
+    reset_active_user,
+    DB_PATH,
+)
 from schemas import TransactionIn, AccountIn, BudgetIn, GoalIn, GoalContribution, CategoryIn, ImportIn
 
+import os
+import re
+import secrets
+from datetime import timedelta, timezone
+
+import jwt
+from pwdlib import PasswordHash
+from fastapi import Depends
+from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
+
+
 app = FastAPI(title='Pennywise API', version='1.0.0')
+
+# Authentication configuration
+JWT_SECRET = os.getenv("JWT_SECRET")
+
+if not JWT_SECRET:
+    raise RuntimeError(
+        "JWT_SECRET is missing. Set it as an environment variable "
+        "before starting Pennywise."
+    )
+
+JWT_ALGORITHM = "HS256"
+ACCESS_TOKEN_MINUTES = 60 * 24 * 7  # 7 days
+
+password_hasher = PasswordHash.recommended()
+bearer_scheme = HTTPBearer(auto_error=False)
+
 
 app.add_middleware(
     CORSMiddleware,
@@ -24,13 +59,243 @@ app.add_middleware(
 )
 
 
+@app.middleware("http")
+async def isolate_authenticated_users(request: Request, call_next):
+    path = request.url.path
+
+    # Public endpoints: health and account creation/login.
+    public_paths = {
+        "/api/health",
+        "/api/auth/register",
+        "/api/auth/login",
+    }
+
+    if path in public_paths:
+        return await call_next(request)
+
+    authorization = request.headers.get("Authorization", "")
+    if not authorization.startswith("Bearer "):
+        return JSONResponse(
+            status_code=401,
+            content={"detail": "Please log in to continue."},
+        )
+
+    token = authorization[7:].strip()
+
+    try:
+        payload = jwt.decode(
+            token,
+            JWT_SECRET,
+            algorithms=[JWT_ALGORITHM],
+        )
+        user_id = int(payload["sub"])
+        token_jti = payload["jti"]
+
+        with central_connect() as conn:
+            session = conn.execute(
+                """SELECT id FROM user_sessions
+                   WHERE user_id = ? AND token_jti = ?""",
+                (user_id, token_jti),
+            ).fetchone()
+
+            user = conn.execute(
+                "SELECT id FROM users WHERE id = ?",
+                (user_id,),
+            ).fetchone()
+
+        if not session or not user:
+            raise ValueError("Session is no longer valid.")
+
+    except (jwt.InvalidTokenError, KeyError, TypeError, ValueError):
+        return JSONResponse(
+            status_code=401,
+            content={"detail": "Your login session is invalid or expired."},
+        )
+
+    context_token = set_active_user(user_id)
+    try:
+        return await call_next(request)
+    finally:
+        reset_active_user(context_token)
+
 @app.on_event('startup')
 def startup(): init_db()
 
 def rows(sql, args=()):
-    with connect() as c: return [dict(r) for r in c.execute(sql,args).fetchall()]
+    with central_connect() as c: return [dict(r) for r in c.execute(sql,args).fetchall()]
 def one(sql,args=()):
     data=rows(sql,args); return data[0] if data else None
+
+def create_access_token(user_id: int) -> str:
+    now = datetime.now(timezone.utc)
+    expires = now + timedelta(minutes=ACCESS_TOKEN_MINUTES)
+    token_jti = secrets.token_urlsafe(24)
+
+    token = jwt.encode(
+        {
+            "sub": str(user_id),
+            "jti": token_jti,
+            "iat": now,
+            "exp": expires,
+        },
+        JWT_SECRET,
+        algorithm=JWT_ALGORITHM,
+    )
+
+    with central_connect() as conn:
+        conn.execute(
+            """
+            INSERT INTO user_sessions (user_id, token_jti, expires_at)
+            VALUES (?, ?, ?)
+            """,
+            (user_id, token_jti, expires.isoformat()),
+        )
+
+    return token
+
+
+def get_current_user(
+    credentials: HTTPAuthorizationCredentials | None = Depends(bearer_scheme),
+):
+    if credentials is None:
+        raise HTTPException(
+            status_code=401,
+            detail="Please log in to continue.",
+            headers={"WWW-Authenticate": "Bearer"},
+        )
+
+    try:
+        payload = jwt.decode(
+            credentials.credentials,
+            JWT_SECRET,
+            algorithms=[JWT_ALGORITHM],
+        )
+        user_id = int(payload["sub"])
+        token_jti = payload["jti"]
+    except (jwt.InvalidTokenError, KeyError, TypeError, ValueError):
+        raise HTTPException(
+            status_code=401,
+            detail="Your login session is invalid or expired.",
+            headers={"WWW-Authenticate": "Bearer"},
+        )
+
+    session = one(
+        """
+        SELECT id FROM user_sessions
+        WHERE user_id = ? AND token_jti = ?
+        """,
+        (user_id, token_jti),
+    )
+
+    if not session:
+        raise HTTPException(
+            status_code=401,
+            detail="Your session has ended. Please log in again.",
+        )
+
+    user = one(
+        "SELECT id, email, created_at FROM users WHERE id = ?",
+        (user_id,),
+    )
+
+    if not user:
+        raise HTTPException(status_code=401, detail="User account not found.")
+
+    return user
+
+
+@app.post("/api/auth/register")
+def register(email: str = Body(...), password: str = Body(...)):
+    email = email.strip().lower()
+
+    if len(email) > 254 or not re.fullmatch(
+        r"[^@\s]+@[^@\s]+\.[^@\s]+", email
+    ):
+        raise HTTPException(status_code=400, detail="Enter a valid email address.")
+
+    if len(password) < 8:
+        raise HTTPException(
+            status_code=400,
+            detail="Password must contain at least 8 characters.",
+        )
+
+    if len(password) > 128:
+        raise HTTPException(
+            status_code=400,
+            detail="Password must be 128 characters or fewer.",
+        )
+
+    password_hash = password_hasher.hash(password)
+
+    try:
+        with central_connect() as conn:
+            cursor = conn.execute(
+                "INSERT INTO users (email, password_hash) VALUES (?, ?)",
+                (email, password_hash),
+            )
+            user_id = cursor.lastrowid
+    except sqlite3.IntegrityError:
+        raise HTTPException(
+            status_code=409,
+            detail="An account with this email already exists.",
+        )
+
+    return {
+        "message": "Account created successfully. You can now log in.",
+        "user": {"id": user_id, "email": email},
+    }
+
+
+@app.post("/api/auth/login")
+def login(email: str = Body(...), password: str = Body(...)):
+    email = email.strip().lower()
+
+    user = one(
+        "SELECT id, email, password_hash FROM users WHERE email = ?",
+        (email,),
+    )
+
+    if not user or not password_hasher.verify(
+        password, user["password_hash"]
+    ):
+        raise HTTPException(
+            status_code=401,
+            detail="Incorrect email or password.",
+        )
+
+    token = create_access_token(user["id"])
+
+    return {
+        "access_token": token,
+        "token_type": "bearer",
+        "user": {"id": user["id"], "email": user["email"]},
+    }
+
+
+@app.get("/api/auth/me")
+def get_me(user=Depends(get_current_user)):
+    return {"user": user}
+
+
+@app.post("/api/auth/logout")
+def logout(
+    credentials: HTTPAuthorizationCredentials = Depends(bearer_scheme),
+    user=Depends(get_current_user),
+):
+    payload = jwt.decode(
+        credentials.credentials,
+        JWT_SECRET,
+        algorithms=[JWT_ALGORITHM],
+    )
+
+    with central_connect() as conn:
+        conn.execute(
+            "DELETE FROM user_sessions WHERE user_id = ? AND token_jti = ?",
+            (user["id"], payload["jti"]),
+        )
+
+    return {"message": "Logged out successfully."}
+
 def valid_date(value):
     try: datetime.strptime(value[:10], '%Y-%m-%d')
     except Exception: raise HTTPException(400, 'Date must use YYYY-MM-DD format.')
@@ -51,13 +316,13 @@ def get_accounts():
     return accounts
 @app.post('/api/accounts')
 def create_account(data: AccountIn):
-    with connect() as c:
+    with central_connect() as c:
         cur=c.execute('INSERT INTO accounts(name,type,opening_balance) VALUES(?,?,?)',(data.name.strip(),data.type,data.opening_balance))
         return dict(c.execute('SELECT * FROM accounts WHERE id=?',(cur.lastrowid,)).fetchone())
 @app.delete('/api/accounts/{account_id}')
 def delete_account(account_id:int):
     if one('SELECT id FROM transactions WHERE account_id=? OR to_account_id=?',(account_id,account_id)): raise HTTPException(400,'This account has transactions. Move or delete them before removing the account.')
-    with connect() as c: c.execute('DELETE FROM accounts WHERE id=?',(account_id,))
+    with central_connect() as c: c.execute('DELETE FROM accounts WHERE id=?',(account_id,))
     return {'ok':True}
 
 @app.get('/api/categories')
@@ -65,7 +330,7 @@ def get_categories(): return rows('SELECT * FROM categories ORDER BY kind,name')
 @app.post('/api/categories')
 def create_category(data:CategoryIn):
     try:
-        with connect() as c:
+        with central_connect() as c:
             cur=c.execute('INSERT INTO categories(name,kind,color,icon) VALUES(?,?,?,?)',(data.name.strip(),data.kind,data.color,data.icon))
             return dict(c.execute('SELECT * FROM categories WHERE id=?',(cur.lastrowid,)).fetchone())
     except sqlite3.IntegrityError: raise HTTPException(409,'A category with that name already exists.')
@@ -88,7 +353,7 @@ def create_transaction(data:TransactionIn):
         if not data.account_id or not data.to_account_id or data.account_id==data.to_account_id: raise HTTPException(400,'Choose two different accounts for a transfer.')
         if not one('SELECT id FROM accounts WHERE id=?',(data.account_id,)) or not one('SELECT id FROM accounts WHERE id=?',(data.to_account_id,)): raise HTTPException(400,'Selected account not found.')
     elif data.account_id and not one('SELECT id FROM accounts WHERE id=?',(data.account_id,)): raise HTTPException(400,'Selected account not found.')
-    with connect() as c:
+    with central_connect() as c:
         cur=c.execute('INSERT INTO transactions(kind,amount,date,category,source,merchant,description,payment_method,account_id,to_account_id,tags,notes,goal_id) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)',(data.kind,data.amount,d,data.category,data.source,data.merchant,data.description,data.payment_method,data.account_id,data.to_account_id,data.tags,data.notes,data.goal_id))
         return dict(c.execute('SELECT * FROM transactions WHERE id=?',(cur.lastrowid,)).fetchone())
 @app.put('/api/transactions/{transaction_id}')
@@ -96,18 +361,18 @@ def update_transaction(transaction_id:int,data:TransactionIn):
     if not one('SELECT id FROM transactions WHERE id=?',(transaction_id,)): raise HTTPException(404,'Transaction not found.')
     d=valid_date(data.date)
     if data.kind=='transfer' and (not data.account_id or not data.to_account_id or data.account_id==data.to_account_id): raise HTTPException(400,'Transfers need two different accounts.')
-    with connect() as c:
+    with central_connect() as c:
         c.execute('UPDATE transactions SET kind=?,amount=?,date=?,category=?,source=?,merchant=?,description=?,payment_method=?,account_id=?,to_account_id=?,tags=?,notes=?,goal_id=? WHERE id=?',(data.kind,data.amount,d,data.category,data.source,data.merchant,data.description,data.payment_method,data.account_id,data.to_account_id,data.tags,data.notes,data.goal_id,transaction_id))
     return one('SELECT * FROM transactions WHERE id=?',(transaction_id,))
 @app.delete('/api/transactions/{transaction_id}')
 def delete_transaction(transaction_id:int):
-    with connect() as c: c.execute('DELETE FROM transactions WHERE id=?',(transaction_id,))
+    with central_connect() as c: c.execute('DELETE FROM transactions WHERE id=?',(transaction_id,))
     return {'ok':True}
 @app.post('/api/transactions/{transaction_id}/duplicate')
 def duplicate_transaction(transaction_id:int):
     t=one('SELECT * FROM transactions WHERE id=?',(transaction_id,))
     if not t: raise HTTPException(404,'Transaction not found.')
-    with connect() as c:
+    with central_connect() as c:
         cur=c.execute('INSERT INTO transactions(kind,amount,date,category,source,merchant,description,payment_method,account_id,to_account_id,tags,notes,goal_id) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)',(t['kind'],t['amount'],date.today().isoformat(),t['category'],t['source'],t['merchant'],t['description'],t['payment_method'],t['account_id'],t['to_account_id'],t['tags'],t['notes'],t['goal_id']))
     return one('SELECT * FROM transactions WHERE id=?',(cur.lastrowid,))
 
@@ -122,12 +387,12 @@ def get_budgets(month:str):
     return budgets
 @app.post('/api/budgets')
 def save_budget(data:BudgetIn):
-    with connect() as c:
+    with central_connect() as c:
         c.execute('INSERT INTO budgets(month,category,amount,recurring) VALUES(?,?,?,?) ON CONFLICT(month,category) DO UPDATE SET amount=excluded.amount,recurring=excluded.recurring',(data.month,data.category,data.amount,int(data.recurring)))
     return one('SELECT * FROM budgets WHERE month=? AND category=?',(data.month,data.category))
 @app.delete('/api/budgets/{budget_id}')
 def delete_budget(budget_id:int):
-    with connect() as c: c.execute('DELETE FROM budgets WHERE id=?',(budget_id,))
+    with central_connect() as c: c.execute('DELETE FROM budgets WHERE id=?',(budget_id,))
     return {'ok':True}
 
 @app.get('/api/goals')
@@ -137,12 +402,12 @@ def get_goals():
     return goals
 @app.post('/api/goals')
 def create_goal(data:GoalIn):
-    with connect() as c:
+    with central_connect() as c:
         cur=c.execute('INSERT INTO goals(name,target_amount,saved_amount,target_date,priority,icon,notes) VALUES(?,?,?,?,?,?,?)',(data.name,data.target_amount,data.saved_amount,data.target_date,data.priority,data.icon,data.notes))
     return one('SELECT * FROM goals WHERE id=?',(cur.lastrowid,))
 @app.put('/api/goals/{goal_id}')
 def update_goal(goal_id:int,data:GoalIn):
-    with connect() as c: c.execute('UPDATE goals SET name=?,target_amount=?,saved_amount=?,target_date=?,priority=?,icon=?,notes=? WHERE id=?',(data.name,data.target_amount,data.saved_amount,data.target_date,data.priority,data.icon,data.notes,goal_id))
+    with central_connect() as c: c.execute('UPDATE goals SET name=?,target_amount=?,saved_amount=?,target_date=?,priority=?,icon=?,notes=? WHERE id=?',(data.name,data.target_amount,data.saved_amount,data.target_date,data.priority,data.icon,data.notes,goal_id))
     return one('SELECT * FROM goals WHERE id=?',(goal_id,))
 @app.post('/api/goals/{goal_id}/contribute')
 def contribute(goal_id:int,data:GoalContribution):
@@ -150,11 +415,11 @@ def contribute(goal_id:int,data:GoalContribution):
     if not goal: raise HTTPException(404,'Goal not found.')
     amount=goal['saved_amount']+data.amount if data.action=='add' else goal['saved_amount']-data.amount
     if amount<0: raise HTTPException(400,'You cannot withdraw more than the goal currently holds.')
-    with connect() as c: c.execute('UPDATE goals SET saved_amount=? WHERE id=?',(amount,goal_id))
+    with central_connect() as c: c.execute('UPDATE goals SET saved_amount=? WHERE id=?',(amount,goal_id))
     return one('SELECT * FROM goals WHERE id=?',(goal_id,))
 @app.delete('/api/goals/{goal_id}')
 def delete_goal(goal_id:int):
-    with connect() as c: c.execute('DELETE FROM goals WHERE id=?',(goal_id,))
+    with central_connect() as c: c.execute('DELETE FROM goals WHERE id=?',(goal_id,))
     return {'ok':True}
 
 @app.get('/api/dashboard')
@@ -204,7 +469,7 @@ def coach(month:str):
 
 @app.get('/api/export/json')
 def export_json():
-    with connect() as c:
+    with central_connect() as c:
         data={table:[dict(r) for r in c.execute(f'SELECT * FROM {table}').fetchall()] for table in ['accounts','categories','transactions','budgets','goals','settings']}
     data['format']='pennywise-backup-v1'; data['exported_at']=datetime.now().isoformat(timespec='seconds')
     return data
@@ -220,7 +485,7 @@ def import_json(data:ImportIn):
     required={'accounts','categories','transactions','budgets','goals','settings'}
     if not required.issubset(backup): raise HTTPException(400,'Backup is missing one or more required data sections.')
     try:
-        with connect() as c:
+        with central_connect() as c:
             if not data.replace_existing and c.execute('SELECT COUNT(*) FROM transactions').fetchone()[0]>0: raise HTTPException(409,'Existing transactions were found. Confirm replace-existing to restore this backup.')
             if data.replace_existing:
                 for table in ['transactions','budgets','goals','categories','accounts','settings']: c.execute(f'DELETE FROM {table}')
@@ -238,5 +503,5 @@ def get_settings(): return {r['key']:r['value'] for r in rows('SELECT * FROM set
 @app.put('/api/settings/{key}')
 def set_setting(key:str,value:str=Body(...)):
     if key not in {'currency','theme','minimum_balance'}: raise HTTPException(400,'Unsupported setting.')
-    with connect() as c: c.execute('INSERT INTO settings(key,value) VALUES(?,?) ON CONFLICT(key) DO UPDATE SET value=excluded.value',(key,value))
+    with central_connect() as c: c.execute('INSERT INTO settings(key,value) VALUES(?,?) ON CONFLICT(key) DO UPDATE SET value=excluded.value',(key,value))
     return {'key':key,'value':value}
